@@ -1,7 +1,7 @@
 # Tester Present RP1210 — J1939 ECM / J1939 bus emulator
 
 `TPRP32.dll` is a TMC **RP1210 vendor DLL** that presents a complete, live **SAE J1939 heavy‑vehicle /
-mobile‑plant bus** — built around a simulated Caterpillar/Perkins **ADEM engine controller**and the J1939 Spec.
+mobile‑plant bus** — built around a simulated Caterpillar/Perkins **engine controller** and the J1939 Spec.
 It enumerates and connects exactly like a real RP1210 adapter, so the whole tool chain (enumerate → connect → scan → diagnose → flash)
 can be exercised **end‑to‑end with no hardware**.
 
