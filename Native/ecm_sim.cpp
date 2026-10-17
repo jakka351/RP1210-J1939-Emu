@@ -2,7 +2,7 @@
  *  ecm_sim.cpp  —  the simulated ADEM ECM behaviour.
  * ============================================================================================= */
 #include "ecm_sim.h"
-#include "../tp.adem.core/src/cat_flash_j1939.h"   // single source of truth for the CAT-ext protocol
+#include "cat_flash_j1939.h"   // single source of truth for the CAT-ext protocol — vendored into Native/
 #include <windows.h>
 #include <string>
 #include <cstring>

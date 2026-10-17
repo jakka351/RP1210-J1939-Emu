@@ -24,7 +24,7 @@
 #include <atomic>
 #include <string>
 #include <utility>
-#include "../tp.adem.core/src/j1939_diag.h"   // shared SAE J1939-73 diagnostic model (DTCs/DM services)
+#include "j1939_diag.h"   // shared SAE J1939-73 diagnostic model (DTCs/DM services) — vendored into Native/
 
 namespace tpemu {
 

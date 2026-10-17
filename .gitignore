@@ -1,0 +1,17 @@
+# Build outputs
+Native/build/
+**/bin/
+**/obj/
+
+# Native intermediates / artifacts
+*.obj
+*.exp
+*.lib
+*.dll
+*.pdb
+*.ilk
+
+# IDE / tooling
+.vs/
+*.user
+*.suo

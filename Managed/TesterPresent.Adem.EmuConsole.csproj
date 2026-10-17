@@ -31,21 +31,22 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- The emulator DLL this console hosts; copied beside the exe so the P/Invoke boundary resolves it. -->
-    <Content Include="..\..\native\tp.rp1210.emu\build\TPRP32.dll"
-             Condition="Exists('..\..\native\tp.rp1210.emu\build\TPRP32.dll')">
+    <!-- The emulator DLL this console hosts; copied beside the exe so the P/Invoke boundary resolves
+         it. Build the Native project first (Native\build_emu.bat) to produce Native\build\TPRP32.dll. -->
+    <Content Include="..\Native\build\TPRP32.dll"
+             Condition="Exists('..\Native\build\TPRP32.dll')">
       <Link>TPRP32.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <!-- RP1210 vendor descriptor + register/unregister scripts beside the exe, so the GUI's
          Register / Unregister VCI buttons can install the beside-exe DLL system-wide (elevated). -->
-    <Content Include="..\..\native\tp.rp1210.emu\TPRP32.INI">
+    <Content Include="..\Native\TPRP32.INI">
       <Link>TPRP32.INI</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="register-vci.ps1"><CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory></Content>
     <Content Include="unregister-vci.ps1"><CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory></Content>
-    <Content Include="..\..\LICENSE" Condition="Exists('..\..\LICENSE')">
+    <Content Include="..\LICENSE" Condition="Exists('..\LICENSE')">
       <Link>LICENSE</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
