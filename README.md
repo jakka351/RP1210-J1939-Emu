@@ -15,7 +15,7 @@ can be exercised **end‑to‑end with no hardware**.
 └─────────────┘               └──────────────┘                         └───────────────────────────┘
 ```
 
-The bus lives **inside)the DLL**, in the connecting client's process (standard RP1210 model): every
+The bus lives **inside the DLL**, in the connecting client's process (standard RP1210 model): every
 client that connects gets its own fresh, continuously‑running bus.
 
 <img width="3838" height="1042" alt="image" src="https://github.com/user-attachments/assets/baac32f3-2b59-4a8d-89ae-2b9dd7b37c1b" />
