@@ -1,4 +1,4 @@
-<a href="https://testerpresent.com.au/"><img width="20%" height="20%" align="right" alt="" src="https://github.com/user-attachments/assets/dfcd8128-6270-4a49-bb2a-666cbd9f946d"></a>
+<a href="https://testerpresent.com.au/"><img width="27%" height="27%" align="right" alt="" src="https://github.com/user-attachments/assets/dfcd8128-6270-4a49-bb2a-666cbd9f946d"></a>
 
 # Tester Present RP1210 — J1939 ECM / J1939 bus emulator
 
