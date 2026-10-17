@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    ADEM / J1939 Bus Emulator — standalone management & configuration console.
+    A WinForms app that RUNS and CONTROLS the Tester Present RP1210 emulator (TPRP32.dll): it starts
+    the simulated heavy-vehicle / mobile-plant J1939 bus in-process, shows the live traffic and the
+    controllers, and lets the operator configure it (inject/clear DTCs, set the VIN, drive flash
+    fault injection). x86 to match the x86 emulator DLL it hosts.
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net481</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x86</PlatformTarget>
+    <AssemblyName>TPSAS-RP1210</AssemblyName>
+    <RootNamespace>TesterPresent.Adem.EmuConsole</RootNamespace>
+    <Product>TPSAS-RP1210 — ADEM J1939 Bus Emulator</Product>
+    <Company>Tester Present — Specialist Automotive Solutions</Company>
+    <Authors>Jack Leighton</Authors>
+    <Copyright>Copyright © 2026 Jack Leighton. Licensed under the GNU General Public License v3.</Copyright>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Tester Present logo, embedded so the branded header needs no external file. -->
+    <EmbeddedResource Include="Assets\tp-logo.jpg">
+      <LogicalName>tp-logo.jpg</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The emulator DLL this console hosts; copied beside the exe so the P/Invoke boundary resolves it. -->
+    <Content Include="..\..\native\tp.rp1210.emu\build\TPRP32.dll"
+             Condition="Exists('..\..\native\tp.rp1210.emu\build\TPRP32.dll')">
+      <Link>TPRP32.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!-- RP1210 vendor descriptor + register/unregister scripts beside the exe, so the GUI's
+         Register / Unregister VCI buttons can install the beside-exe DLL system-wide (elevated). -->
+    <Content Include="..\..\native\tp.rp1210.emu\TPRP32.INI">
+      <Link>TPRP32.INI</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="register-vci.ps1"><CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory></Content>
+    <Content Include="unregister-vci.ps1"><CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory></Content>
+    <Content Include="..\..\LICENSE" Condition="Exists('..\..\LICENSE')">
+      <Link>LICENSE</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>
