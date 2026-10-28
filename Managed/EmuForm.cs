@@ -49,6 +49,7 @@ namespace TesterPresent.Adem.EmuConsole
         private TextBox _vinText = null!, _spnText = null!, _fmiText = null!;
         private ComboBox _saCombo = null!, _faultCombo = null!;
         private ToolStripStatusLabel _sbLive = null!;
+        private FlowLayoutPanel _signalFlow = null!;   // live-signal slider cards for the selected module
 
         public EmuForm()
         {
@@ -115,6 +116,10 @@ namespace TesterPresent.Adem.EmuConsole
 
         private Control BuildBody()
         {
+            var outer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
+            outer.RowStyles.Add(new RowStyle(SizeType.Percent, 68));   // the existing 2x2 grid
+            outer.RowStyles.Add(new RowStyle(SizeType.Percent, 32));   // the live-signals strip
+
             var grid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2, Padding = new Padding(6) };
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 46));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 54));
@@ -125,7 +130,65 @@ namespace TesterPresent.Adem.EmuConsole
             grid.Controls.Add(Group("Bus activity (live PGN broadcast)", BuildActivityGrid()), 1, 0);
             grid.Controls.Add(Group("Configure (DTC / VIN / flash fault)", BuildConfig()), 0, 1);
             grid.Controls.Add(Group("Recent frames", BuildRecent()), 1, 1);
-            return grid;
+
+            outer.Controls.Add(grid, 0, 0);
+            outer.Controls.Add(Group("Live signals — drag to drive the selected module's telemetry onto the bus", BuildSignals()), 0, 1);
+            return outer;
+        }
+
+        private Control BuildSignals()
+        {
+            _signalFlow = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = true, AutoScroll = true, Padding = new Padding(4),
+            };
+            return _signalFlow;
+        }
+
+        // Rebuild the slider cards for the currently-selected module (called on connect + module change).
+        private void RebuildSignals()
+        {
+            if (_signalFlow == null) return;
+            _signalFlow.SuspendLayout();
+            _signalFlow.Controls.Clear();
+            if (_client >= 0 && Target(out int sa))
+            {
+                int n = EmuNative.emu_signal_count(sa);
+                for (int i = 0; i < n; i++)
+                {
+                    var name = new StringBuilder(48);
+                    var unit = new StringBuilder(16);
+                    if (EmuNative.emu_signal_info(sa, i, name, name.Capacity, unit, unit.Capacity,
+                                                  out double mn, out double mx, out double cur) == 0) continue;
+                    _signalFlow.Controls.Add(MakeSignalCard(sa, i, name.ToString(), unit.ToString(), mn, mx, cur));
+                }
+                if (n == 0)
+                    _signalFlow.Controls.Add(new Label { Text = "(no drivable signals for this module)", AutoSize = true, ForeColor = Color.Gray, Margin = new Padding(8, 10, 8, 8) });
+            }
+            _signalFlow.ResumeLayout();
+        }
+
+        private Control MakeSignalCard(int sa, int idx, string name, string unit, double min, double max, double cur)
+        {
+            var card = new Panel { Width = 152, Height = 94, Margin = new Padding(4), BorderStyle = BorderStyle.FixedSingle };
+            var title = new Label { Text = name, AutoSize = false, Width = 144, Height = 16, Location = new Point(4, 3), Font = new Font(Font, FontStyle.Bold) };
+            var val = new Label { AutoSize = false, Width = 144, Height = 16, Location = new Point(4, 21), ForeColor = Color.MidnightBlue };
+            var bar = new TrackBar { Minimum = 0, Maximum = 1000, Width = 146, Location = new Point(2, 42), TickStyle = TickStyle.None, SmallChange = 5, LargeChange = 50 };
+
+            double span = (max > min) ? (max - min) : 1.0;
+            int toTick(double v) { int t = (int)Math.Round((v - min) / span * 1000.0); return t < 0 ? 0 : (t > 1000 ? 1000 : t); }
+            double toVal(int t) => min + (t / 1000.0) * span;
+            void showVal(double v) => val.Text = unit.Length > 0 ? $"{v:0.##} {unit}" : $"{v:0.##}";
+
+            bar.Value = toTick(cur);
+            showVal(cur);
+            bar.Scroll += (_, __) => { double v = toVal(bar.Value); EmuNative.emu_set_signal(sa, idx, v); showVal(v); };
+
+            card.Controls.Add(title);
+            card.Controls.Add(val);
+            card.Controls.Add(bar);
+            return card;
         }
 
         private Control BuildControllersGrid()
@@ -168,6 +231,7 @@ namespace TesterPresent.Adem.EmuConsole
             var saRow = Flow();
             saRow.Controls.Add(Lab("Module:", 54));
             _saCombo = new ComboBox { Width = 260, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 2, 6, 2) };
+            _saCombo.SelectedIndexChanged += (_, __) => RebuildSignals();   // swap the live-signal sliders to the chosen module
             saRow.Controls.Add(_saCombo);
             rows.Controls.Add(saRow);
 
@@ -192,7 +256,7 @@ namespace TesterPresent.Adem.EmuConsole
             var fltRow = Flow();
             fltRow.Controls.Add(Lab("Flash fault:", 54));
             _faultCombo = new ComboBox { Width = 150, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 2, 6, 2) };
-            _faultCombo.Items.AddRange(new object[] { "none", "inappropriate", "invalidoffset", "badchecksum", "erasefail", "stuck" });
+            _faultCombo.Items.AddRange(new object[] { "none", "inappropriate", "badfileinfo", "invalidoffset", "badchecksum", "erasefail", "stuck" });
             _faultCombo.SelectedIndex = 0;
             _applyFaultBtn = Btn("Apply", 60); _applyFaultBtn.Click += (_, __) => { EmuNative.emu_set_fault((string)_faultCombo.SelectedItem!); Status($"Flash fault = {_faultCombo.SelectedItem}"); };
             fltRow.Controls.Add(_faultCombo); fltRow.Controls.Add(_applyFaultBtn);
@@ -230,6 +294,7 @@ namespace TesterPresent.Adem.EmuConsole
             _totalFrames = 0; _framesAtLastRate = 0; _rate = 0; _pgnCounts.Clear(); _recent.Clear();
             _traffic.Clear(); _pgnGrid.Rows.Clear();
             PopulateControllers();
+            RebuildSignals();
             var sb = new StringBuilder(64);
             if (EmuNative.emu_get_vin(sb, sb.Capacity) > 0) _vinText.Text = sb.ToString();
             _lastRateAt = DateTime.UtcNow;
@@ -242,6 +307,7 @@ namespace TesterPresent.Adem.EmuConsole
             _timer.Stop();
             if (_client >= 0) { try { EmuNative.RP1210_ClientDisconnect(_client); } catch { } _client = -1; }
             SetRunning(false);
+            RebuildSignals();   // _client < 0 now → clears the slider panel
         }
 
         private void OnTick()

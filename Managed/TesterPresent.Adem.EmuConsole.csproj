@@ -31,10 +31,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- The emulator DLL this console hosts; copied beside the exe so the P/Invoke boundary resolves
-         it. Build the Native project first (Native\build_emu.bat) to produce Native\build\TPRP32.dll. -->
+    <!-- The emulator DLL this console hosts; copied beside the exe so the P/Invoke boundary resolves it. -->
     <Content Include="..\Native\build\TPRP32.dll"
-             Condition="Exists('..\Native\build\TPRP32.dll')">
+             Condition="Exists('..\native\build\TPRP32.dll')">
       <Link>TPRP32.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>

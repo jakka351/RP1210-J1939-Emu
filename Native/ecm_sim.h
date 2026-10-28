@@ -20,11 +20,14 @@
 #include <cstdint>
 #include <vector>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <atomic>
 #include <string>
 #include <utility>
-#include "j1939_diag.h"   // shared SAE J1939-73 diagnostic model (DTCs/DM services) — vendored into Native/
+#include "../tp.adem.core/src/j1939_diag.h"       // shared SAE J1939-73 diagnostic model (DTCs/DM services)
+#include "../tp.adem.core/src/cat_security_j1939.h" // shared CAT access-level (password) model
+
 
 namespace tpemu {
 
@@ -54,11 +57,31 @@ class BusNode {
 public:
     BusNode(uint8_t sa, uint8_t function, uint16_t identity, std::string label);
 
+    // Full J1939-81 NAME constructor for the mobile-plant electro-hydraulic controllers: packs the
+    // industry group, vehicle system, function (+ instance), ECU instance, 11-bit manufacturer code
+    // and 21-bit identity into the NAME, so the discovery cascade (note 02) can decode a realistic
+    // industry group / function / manufacturer for each controller. Fixed-address ECU (AAC bit = 0).
+    BusNode(uint8_t sa, std::string label, uint8_t industryGroup, uint8_t vehicleSystem,
+            uint8_t function, uint8_t functionInstance, uint8_t ecuInstance,
+            uint16_t mfgCode, uint32_t identity);
+
     uint8_t     sa() const { return sa_; }
     const std::string& label() const { return label_; }
 
     void addPeriodic(uint32_t pgn, uint8_t priority, unsigned long long periodMs, std::vector<uint8_t> data);
-    void addRequestResponse(uint32_t pgn, std::vector<uint8_t> payload, bool bam);
+    // destSpecificOnly responses answer ONLY a request addressed to this node's SA (not a global
+    // 0xFF sweep), so e.g. Software ID stays unique to the engine on a global request while each EH
+    // controller still answers it when addressed directly (note 02 step 2 is destination-specific).
+    void addRequestResponse(uint32_t pgn, std::vector<uint8_t> payload, bool bam, bool destSpecificOnly = false);
+
+    // ---- live, drivable telemetry signals (for the emulator console's live-control sliders) ----
+    // Each signal maps an engineering value to raw bytes inside one of this node's periodic broadcasts,
+    // so the console can change what the bus reports in real time. value = raw*scale + offset.
+    void addSignal(std::string label, std::string unit, uint32_t pgn, uint8_t off, uint8_t width,
+                   bool le, double scale, double offset, double minV, double maxV);
+    int  signalCount() const { return (int)signals_.size(); }
+    bool signalInfo(int idx, std::string& label, std::string& unit, double& minV, double& maxV, double& cur) const;
+    bool setSignal(int idx, double value);   // clamp to [minV,maxV], re-encode into the periodic payload
 
     // SAE J1939-73 diagnostics for this controller (DTCs, lamps, readiness, tests). `dmCapable`
     // nodes broadcast DM1 and answer DM1/DM2/DM5/DM4 requests and DM3/DM11/DM7 commands.
@@ -68,15 +91,20 @@ public:
 
     J1939Msg addressClaimed() const;                               // PGN 0xEE00 with this node's NAME
     void service(unsigned long long now, std::deque<J1939Msg>& out);  // enqueue due periodics
-    void respond(uint32_t reqPgn, std::deque<J1939Msg>& out) const;   // answer a PGN request
+    void respond(uint32_t reqPgn, uint8_t reqDst, std::deque<J1939Msg>& out) const;   // answer a PGN request
 
 private:
     uint8_t  sa_;
     uint8_t  name_[8];
     std::string label_;
     std::vector<Periodic> periodics_;
-    struct Resp { uint32_t pgn; std::vector<uint8_t> payload; bool bam; };
+    struct Resp { uint32_t pgn; std::vector<uint8_t> payload; bool bam; bool destOnly; };
     std::vector<Resp> responses_;
+
+    struct LiveSignal { std::string label, unit; uint32_t pgn; uint8_t off, width; bool le; double scale, offset, minV, maxV; };
+    std::vector<LiveSignal> signals_;
+    std::vector<uint8_t>* periodicData(uint32_t pgn);             // the live payload of a periodic, by PGN
+    const std::vector<uint8_t>* periodicData(uint32_t pgn) const;
 };
 
 class EcmSim {
@@ -99,8 +127,14 @@ public:
     void clearDtcsFor(uint8_t sa, int which);              // 0=active, 1=stored, 2=both
     std::string vin();
     void setVin(const std::string& v);
-    void setFaultByName(const char* name);                 // none|inappropriate|invalidoffset|badchecksum|erasefail|stuck
+    void setFaultByName(const char* name);                 // none|inappropriate|badfileinfo|invalidoffset|badchecksum|erasefail|stuck
     bool flashActive();                                    // true while an ECM flash is in progress
+    void setToolSa(uint8_t sa);                            // RP1210 Protect_J1939_Address: the tool's claimed SA
+
+    // ---- live drivable signals (console sliders): per-node telemetry the operator can drive live ----
+    int  signalCount(uint8_t sa);
+    bool signalInfo(uint8_t sa, int idx, std::string& label, std::string& unit, double& minV, double& maxV, double& cur);
+    bool setSignal(uint8_t sa, int idx, double value);
 
 private:
     void enqueue(const J1939Msg& m);
@@ -112,7 +146,7 @@ private:
     // ---- SAE J1939-73 diagnostic stack (engine + dm-capable nodes) ----
     void seedDiagnostics();             // inject the default/ENV faults, readiness, test suites
     void serviceDiag(unsigned long long now);                  // emit DM1 broadcasts (dynamic payload)
-    bool handleDiagRequest(uint32_t reqPgn, uint8_t dst);      // DM1/DM2/DM5/DM4 on request (true if handled)
+    bool handleDiagRequest(uint32_t reqPgn, uint8_t dst);      // DM1/DM2/DM5/DM4 on request; DM3/DM11 clear + ACKM (true if handled)
     bool handleDiagCommand(const J1939Msg& m);                 // DM11/DM3 clear, DM7->DM30 (true if handled)
     void emitDm(uint8_t sa, uint32_t pgn, const std::vector<uint8_t>& payload, uint8_t dst = 0xFF);
     void sendAck(uint8_t sa, uint8_t toSa, uint32_t ackedPgn, uint8_t control);  // ACKM 0xE800
@@ -124,8 +158,29 @@ private:
 
     // Real ADEM J1939 CAT-ext flash protocol (ECM side; see tp.adem.core/src/cat_flash_j1939.h)
     // + connection-mode transport receive.
+    // CAT access-level (password) over the DM14/15/16 memory tunnel (RE/04 §3.2). Byte-compares the
+    // presented pair (ServiceTool constant / stored customer pair); never the permissive "any pair"
+    // rule. Verify-on-iron; this is the ECM side so the tool's security path can be tested.
+    void handleDm14(const J1939Msg& m);
+    void handleDm16(const J1939Msg& m);
+    void evaluateSecurity();
+    int        secLevel_ = catsec::LVL_NORMAL;   // level the ECM currently publishes
+    uint32_t   memPointer_ = 0;                  // map PID the last DM14 write targeted
+    uint8_t    memCommand_ = 0xFF;               // last DM14 command (read/write)
+    std::vector<uint8_t> secPw1_, secPw2_;       // presented password buffers
+    std::vector<uint8_t> custPw1_, custPw2_;     // customer pair stored in the ECM (blank = none)
+
+    // Configuration parameters addressable over the memory tunnel (key = 24-bit pointer). Each has a
+    // required write level; a write below the ECM's current level is refused (DM15 OperationFailed),
+    // so the tool's UI gate AND the ECM's own enforcement are both exercised (RE/04 §3.5). These are
+    // emulator test parameters only — no real rating / FLS / immobiliser PIDs are modelled.
+    std::map<uint32_t, std::vector<uint8_t>> params_;
+    std::map<uint32_t, int> paramWriteLevel_;
+    void seedConfigParams();
+
     void handleTpCm(const J1939Msg& m);
     void handleTpDt(const J1939Msg& m);
+
     void handleCatExt(uint8_t src, const std::vector<uint8_t>& payload);  // a CAT-ext msg on 0xEF00
     void sendCurrentStatus(uint8_t src);                                  // reply to a PID 0x88 read
     void replyStatus(uint8_t src, uint8_t cmd, uint8_t mode, const std::vector<uint8_t>& additional);
@@ -150,9 +205,10 @@ private:
 
     // Fault injection (env TPRP_EMU_FAULT) to exercise the tool's recovery / verify / precondition
     // paths against a faithful ECM: inappropriate | invalidoffset | badchecksum | erasefail | stuck.
-    enum class Fault { None, Inappropriate, InvalidOffset, BadChecksum, EraseFail, Stuck };
+    enum class Fault { None, Inappropriate, BadFileInfo, InvalidOffset, BadChecksum, EraseFail, Stuck };
     Fault fault_ = Fault::None;
     bool  faultArmed_ = false;             // one-shot faults (fired once, then cleared)
+    void  refreshFaultFromShared();        // pull the armed fault from the shared control file
 
     bool     tpActive_ = false;
     uint8_t  tpSrc_ = 0;

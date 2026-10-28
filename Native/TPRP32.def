@@ -21,3 +21,6 @@ EXPORTS
     emu_set_fault
     emu_flash_active
     emu_running
+    emu_signal_count
+    emu_signal_info
+    emu_set_signal

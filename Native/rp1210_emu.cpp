@@ -14,13 +14,23 @@
 
 using namespace tpemu;
 
-// RP1210 return / error codes (subset).
+// RP1210 return / error codes (subset) — the TMC RP1210 standard values. ClientConnect returns
+// 0..127 = client id or 128..255 = error; every other entry point returns 0 on success and the
+// positive error code otherwise, EXCEPT ReadMessage, which returns a byte count (> 0), 0 for
+// "nothing available", or the NEGATIVE error code (so a host can never mistake an error for data).
 enum {
-    RP1210_NO_ERROR          = 0,
-    ERR_CLIENT_AREA_FULL     = 131,
-    ERR_INVALID_CLIENT_ID    = 135,
-    ERR_INVALID_PROTOCOL     = 143,
-    ERR_MESSAGE_NOT_SENT     = 146,
+    RP1210_NO_ERROR             = 0,
+    ERR_INVALID_CLIENT_ID       = 129,
+    ERR_CLIENT_AREA_FULL        = 131,
+    ERR_INVALID_PROTOCOL        = 136,
+    ERR_COMMAND_NOT_SUPPORTED   = 143,
+    ERR_MESSAGE_NOT_SENT        = 152,
+};
+
+// RP1210_SendCommand numbers handled here.
+enum {
+    RP1210_Set_All_Filters_States_to_Pass = 3,
+    RP1210_Protect_J1939_Address          = 19,
 };
 
 static EcmSim  g_sim;
@@ -75,7 +85,8 @@ short WINAPI RP1210_SendMessage(short nClientID, char* fpchClientMessage, short 
 
 short WINAPI RP1210_ReadMessage(short nClientID, char* fpchAPIMessage, short nBufferSize, short /*nBlock*/)
 {
-    if (nClientID != g_client || !g_connected) return ERR_INVALID_CLIENT_ID;
+    // Errors from ReadMessage are NEGATIVE per RP1210 (a positive value is a byte count).
+    if (nClientID != g_client || !g_connected) return (short)-ERR_INVALID_CLIENT_ID;
     if (!fpchAPIMessage || nBufferSize < 11) return 0;
 
     J1939Msg m;
@@ -99,10 +110,20 @@ short WINAPI RP1210_ReadMessage(short nClientID, char* fpchAPIMessage, short nBu
     return (short)(10 + n);
 }
 
-short WINAPI RP1210_SendCommand(short /*nCmd*/, short nClientID, char* /*cmd*/, short /*size*/)
+short WINAPI RP1210_SendCommand(short nCmd, short nClientID, char* cmd, short size)
 {
     if (nClientID != g_client || !g_connected) return ERR_INVALID_CLIENT_ID;
-    return RP1210_NO_ERROR;   // accept filter/echo/etc. commands
+    switch (nCmd) {
+        case RP1210_Protect_J1939_Address:
+            // [SA][NAME:8][blocking status]: the adapter claims the address on the client's behalf.
+            // The simulated controllers use distinct fixed SAs, so any tool SA is uncontested.
+            if (!cmd || size < 10) return ERR_MESSAGE_NOT_SENT;
+            g_sim.setToolSa((unsigned char)cmd[0]);
+            return RP1210_NO_ERROR;
+        case RP1210_Set_All_Filters_States_to_Pass:
+        default:
+            return RP1210_NO_ERROR;   // accept filter/echo/etc. commands
+    }
 }
 
 short WINAPI RP1210_ReadVersion(char* DLLMajor, char* DLLMinor, char* APIMajor, char* APIMinor)
@@ -138,6 +159,7 @@ short WINAPI RP1210_GetErrorMsg(short errCode, char* fpchMessage)
         case ERR_CLIENT_AREA_FULL:  s = "Client area full (already connected)."; break;
         case ERR_INVALID_CLIENT_ID: s = "Invalid client id."; break;
         case ERR_INVALID_PROTOCOL:  s = "Invalid or unsupported protocol string."; break;
+        case ERR_COMMAND_NOT_SUPPORTED: s = "Command not supported."; break;
         case ERR_MESSAGE_NOT_SENT:  s = "Message not sent (bad length)."; break;
         default:                    s = "Tester Present RP1210 emulator error."; break;
     }
@@ -197,6 +219,22 @@ int emu_set_vin(const char* v) { if (v) g_sim.setVin(v); return 0; }
 int emu_set_fault(const char* name) { g_sim.setFaultByName(name); return 0; }
 int emu_flash_active() { return g_sim.flashActive() ? 1 : 0; }
 int emu_running() { return g_sim.running() ? 1 : 0; }
+
+// Live drivable telemetry signals (console sliders): enumerate/describe/set per-controller signals.
+int emu_signal_count(int sa) { return g_sim.signalCount((unsigned char)sa); }
+
+int emu_signal_info(int sa, int idx, char* label, int labelLen, char* unit, int unitLen,
+                    double* minV, double* maxV, double* cur)
+{
+    std::string l, u; double mn = 0, mx = 0, cu = 0;
+    if (!g_sim.signalInfo((unsigned char)sa, idx, l, u, mn, mx, cu)) return 0;
+    if (minV) *minV = mn; if (maxV) *maxV = mx; if (cur) *cur = cu;
+    if (label && labelLen > 0) { int n = (int)l.size(); if (n > labelLen - 1) n = labelLen - 1; memcpy(label, l.data(), n); label[n] = '\0'; }
+    if (unit  && unitLen  > 0) { int n = (int)u.size(); if (n > unitLen  - 1) n = unitLen  - 1; memcpy(unit,  u.data(), n); unit[n]  = '\0'; }
+    return 1;
+}
+
+int emu_set_signal(int sa, int idx, double value) { return g_sim.setSignal((unsigned char)sa, idx, value) ? 1 : 0; }
 
 BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
 {

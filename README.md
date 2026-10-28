@@ -1,9 +1,9 @@
 <a href="https://testerpresent.com.au/"><img width="27%" height="27%" align="right" alt="" src="https://github.com/user-attachments/assets/dfcd8128-6270-4a49-bb2a-666cbd9f946d"></a>
 
-# Tester Present RP1210 — J1939 ECM / J1939 bus emulator
+# Tester Present RP1210 — J1939 Controller / Bus Emulator
 
 `TPRP32.dll` is a TMC **RP1210 vendor DLL** that presents a complete, live **SAE J1939 heavy‑vehicle /
-mobile‑plant bus** — built around a simulated Caterpillar/Perkins **engine controller** and the J1939 Spec.
+mobile‑plant bus** — built around a simulated Caterpillar **engine controller** and various associated **electro-hydraulic controllers** with the J1939 Spec.
 It enumerates and connects exactly like a real RP1210 adapter, so the whole tool chain (enumerate → connect → scan → diagnose → flash)
 can be exercised **end‑to‑end with no hardware**.
 
@@ -49,7 +49,7 @@ seconds argument for a bounded run: `build\emu_monitor.exe build\TPRP32.dll 10`.
 
 Every controller claims its own address (PGN `0xEE00`, J1939‑81 NAME), **broadcasts its PGNs
 continuously** on their normal periods, and answers PGN requests (`0xEA00`). The bus goes quiet only
-while the engine is being flashed (DM13).
+while the engine is being flashed (DM13). Electro-HydraulicControllers can be manipulated via the UI controls.
 
 | SA | Controller | Spec'd broadcasts (J1939‑71) | Request responses |
 |----|------------|------------------------------|-------------------|
@@ -63,6 +63,12 @@ while the engine is being flashed (DM13).
 | `0x29` | Telematics / GPS | Time/Date `0xFEE6`, Vehicle Position `0xFEF3` | Component ID `0xFEEB` |
 | `0x31` | Cab Controller — Primary | Prop‑B `0xFF31` | Component ID `0xFEEB` |
 | `0x3D` | Aftertreatment / SCR | DEF tank `0xFE56`, DM1 `0xFECA`, Prop‑B `0xFF3D` | Component ID `0xFEEB` |
+| `0x27` | Proportional Valve Controller  |  |
+| `0x2B` | Hydrostatic Drive  |  |
+| `0x2C` | I/O Module  |  |
+| `0x80` | Auxillary Valve 1  |  |
+| `0x81` | Auxillary Valve 2  |  |
+| `0xF1` | Joystick/Variable Displacement Control  |  |
 
 Only the engine answers **Software ID (`0xFEDA`)** and **VIN (`0xFEEC`)**, so the tool's
 `resolve_target` and the J1939 scan's engine detection uniquely identify the ADEM engine on the

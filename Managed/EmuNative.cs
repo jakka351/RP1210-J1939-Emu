@@ -54,5 +54,16 @@ namespace TesterPresent.Adem.EmuConsole
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int emu_running();
+
+        // ---- live drivable signals (console sliders) ----
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int emu_signal_count(int sa);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        public static extern int emu_signal_info(int sa, int idx, StringBuilder label, int labelLen,
+            StringBuilder unit, int unitLen, out double minV, out double maxV, out double cur);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int emu_set_signal(int sa, int idx, double value);
     }
 }

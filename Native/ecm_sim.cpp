@@ -2,10 +2,13 @@
  *  ecm_sim.cpp  —  the simulated ADEM ECM behaviour.
  * ============================================================================================= */
 #include "ecm_sim.h"
-#include "cat_flash_j1939.h"   // single source of truth for the CAT-ext protocol — vendored into Native/
+#include "../tp.adem.core/src/cat_flash_j1939.h"   // single source of truth for the CAT-ext protocol
 #include <windows.h>
 #include <string>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
 
 namespace tpemu {
 
@@ -22,6 +25,7 @@ enum : uint32_t {
     PGN_VIN              = 0x00FEEC,   // 65260 vehicle identification
     PGN_SOFTWARE_ID      = 0x00FEDA,   // 65242 software identification
     PGN_COMPONENT_ID     = 0x00FEEB,   // 65259 component identification
+    PGN_ECUID            = 0x00FDC5,   // 64965 ECU identification (part/serial/location/type + CAT ECU-info)
     PGN_FLASH_DATA       = 0x00FF50,   // transported PGN carrying flash image blocks
 };
 
@@ -36,6 +40,39 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t* p, size_t n)
 
 static unsigned long long now_ms() { return GetTickCount64(); }
 
+// --- Shared cross-process fault control -----------------------------------------------------
+// The emulator runs in-process in EACH client (RP1210 model), so a fault armed in one process
+// (the console, via emu_set_fault) would never reach a separate flash client. We publish the
+// armed fault NAME to a shared file; every client reads it when a flash begins, so console fault
+// injection reaches the flash tool across process boundaries.
+static std::string sharedFaultPath()
+{
+    char tmp[MAX_PATH] = { 0 };
+    DWORD n = GetTempPathA((DWORD)sizeof(tmp), tmp);
+    std::string p = (n > 0 && n < sizeof(tmp)) ? std::string(tmp) : std::string(".\\");
+    return p + "tprp32_emu_fault.txt";
+}
+static std::string readSharedFault()
+{
+    FILE* f = fopen(sharedFaultPath().c_str(), "rb");
+    if (!f) return std::string();
+    char buf[32] = { 0 };
+    size_t r = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[r < sizeof(buf) ? r : sizeof(buf) - 1] = 0;
+    std::string s(buf);
+    while (!s.empty()) { char c = s.back(); if (c==10||c==13||c==9||c==32) s.pop_back(); else break; }
+    return s;
+}
+static void writeSharedFault(const char* name)
+{
+    FILE* f = fopen(sharedFaultPath().c_str(), "wb");
+    if (!f) return;
+    const char* s = (name && *name) ? name : "none";
+    fwrite(s, 1, strlen(s), f);
+    fclose(f);
+}
+
 void EcmSim::start()
 {
     std::lock_guard<std::mutex> lk(mu_);
@@ -49,12 +86,19 @@ void EcmSim::start()
     curOffset_ = 0; armLen_ = 0; storedChecksum_ = 0; burnUntilMs_ = 0; lastFlashMs_ = 0;
     flashBuf_.clear(); flashCrc_ = 0xFFFFFFFFu; swPartNumber_.clear();
 
+    // Reset access-level state: a fresh connection starts at Normal with no presented pair.
+    secLevel_ = catsec::LVL_NORMAL; memPointer_ = 0; memCommand_ = 0xFF;
+    secPw1_.clear(); secPw2_.clear();
+    seedConfigParams();
+
+
     // Optional fault injection (env TPRP_EMU_FAULT) so the tool's recovery/verify/precondition
     // paths can be exercised against a faithful ECM.
     fault_ = Fault::None; faultArmed_ = false;
     char fb[32] = { 0 };
     if (GetEnvironmentVariableA("TPRP_EMU_FAULT", fb, (DWORD)sizeof(fb)) > 0) {
         if      (_stricmp(fb, "inappropriate") == 0) fault_ = Fault::Inappropriate;
+        else if (_stricmp(fb, "badfileinfo")   == 0) fault_ = Fault::BadFileInfo;
         else if (_stricmp(fb, "invalidoffset") == 0) { fault_ = Fault::InvalidOffset; faultArmed_ = true; }
         else if (_stricmp(fb, "badchecksum")   == 0) fault_ = Fault::BadChecksum;
         else if (_stricmp(fb, "erasefail")     == 0) fault_ = Fault::EraseFail;
@@ -95,16 +139,19 @@ J1939Msg EcmSim::addressClaimed() const
 static std::vector<J1939Msg> buildBam(uint8_t sa, uint32_t pgn, const std::vector<uint8_t>& payload)
 {
     std::vector<J1939Msg> out;
-    uint16_t total = (uint16_t)payload.size();
+    // J1939-21: one BAM carries at most 255 packets x 7 = 1785 bytes. Clamp rather than emit a
+    // malformed header (the packet count would otherwise wrap in the uint8_t).
+    size_t n = payload.size() > 1785 ? 1785 : payload.size();
+    uint16_t total = (uint16_t)n;
     uint8_t packets = (uint8_t)((total + 6) / 7);
     J1939Msg cm; cm.pgn = 0x00EC00; cm.priority = 7; cm.src = sa; cm.dst = 0xFF;
     cm.data = { 0x20, (uint8_t)(total & 0xFF), (uint8_t)(total >> 8), packets, 0xFF,
                 (uint8_t)(pgn & 0xFF), (uint8_t)((pgn >> 8) & 0xFF), (uint8_t)((pgn >> 16) & 0xFF) };
     out.push_back(cm);
-    for (uint8_t i = 0; i < packets; ++i) {
+    for (unsigned i = 0; i < packets; ++i) {
         J1939Msg dt; dt.pgn = 0x00EB00; dt.priority = 7; dt.src = sa; dt.dst = 0xFF;
         dt.data.push_back((uint8_t)(i + 1));
-        for (int j = 0; j < 7; ++j) { size_t idx = (size_t)i * 7 + j; dt.data.push_back(idx < payload.size() ? payload[idx] : 0xFF); }
+        for (int j = 0; j < 7; ++j) { size_t idx = (size_t)i * 7 + j; dt.data.push_back(idx < n ? payload[idx] : 0xFF); }
         out.push_back(dt);
     }
     return out;
@@ -124,6 +171,27 @@ BusNode::BusNode(uint8_t sa, uint8_t function, uint16_t identity, std::string la
     name_[6] = 0x00; name_[7] = 0x00;
 }
 
+// Full J1939-81 NAME (mobile-plant EH controllers). 64-bit little-endian NAME bit-fields:
+//   Identity 0:20 (21b) | Manufacturer 21:31 (11b) | ECU Instance 32:34 (3b) | Function Instance
+//   35:39 (5b) | Function 40:47 (8b) | reserved 48 | Vehicle System 49:55 (7b) | Vehicle System
+//   Instance 56:59 (4b) | Industry Group 60:62 (3b) | Arbitrary-Address-Capable 63 (1b).
+BusNode::BusNode(uint8_t sa, std::string label, uint8_t industryGroup, uint8_t vehicleSystem,
+                 uint8_t function, uint8_t functionInstance, uint8_t ecuInstance,
+                 uint16_t mfgCode, uint32_t identity)
+    : sa_(sa), label_(std::move(label))
+{
+    identity &= 0x1FFFFFu;   // 21-bit
+    mfgCode  &= 0x07FFu;     // 11-bit
+    name_[0] = (uint8_t)(identity & 0xFF);
+    name_[1] = (uint8_t)((identity >> 8) & 0xFF);
+    name_[2] = (uint8_t)(((identity >> 16) & 0x1F) | ((mfgCode & 0x07) << 5));   // id[16:20] | mfg[0:2]
+    name_[3] = (uint8_t)((mfgCode >> 3) & 0xFF);                                 // mfg[3:10]
+    name_[4] = (uint8_t)((ecuInstance & 0x07) | ((functionInstance & 0x1F) << 3));
+    name_[5] = function;
+    name_[6] = (uint8_t)((vehicleSystem & 0x7F) << 1);                           // bit 48 reserved = 0
+    name_[7] = (uint8_t)((industryGroup & 0x07) << 4);                           // VSI = 0, AAC = 0 (fixed)
+}
+
 J1939Msg BusNode::addressClaimed() const
 {
     J1939Msg m; m.pgn = 0x00EE00; m.priority = 6; m.src = sa_; m.dst = 0xFF;
@@ -137,9 +205,9 @@ void BusNode::addPeriodic(uint32_t pgn, uint8_t priority, unsigned long long per
     periodics_.push_back(std::move(p));
 }
 
-void BusNode::addRequestResponse(uint32_t pgn, std::vector<uint8_t> payload, bool bam)
+void BusNode::addRequestResponse(uint32_t pgn, std::vector<uint8_t> payload, bool bam, bool destSpecificOnly)
 {
-    responses_.push_back(Resp{ pgn, std::move(payload), bam });
+    responses_.push_back(Resp{ pgn, std::move(payload), bam, destSpecificOnly });
 }
 
 void BusNode::service(unsigned long long now, std::deque<J1939Msg>& out)
@@ -153,13 +221,70 @@ void BusNode::service(unsigned long long now, std::deque<J1939Msg>& out)
     }
 }
 
-void BusNode::respond(uint32_t reqPgn, std::deque<J1939Msg>& out) const
+void BusNode::respond(uint32_t reqPgn, uint8_t reqDst, std::deque<J1939Msg>& out) const
 {
     for (auto& r : responses_) {
         if (r.pgn != reqPgn) continue;
+        if (r.destOnly && reqDst == 0xFF) continue;   // dest-specific response: never answer a global sweep
         if (r.bam) { for (auto& f : buildBam(sa_, r.pgn, r.payload)) out.push_back(f); }
         else { J1939Msg m; m.pgn = r.pgn; m.priority = 6; m.src = sa_; m.dst = 0xFF; m.data = r.payload; out.push_back(m); }
     }
+}
+
+// ---- live drivable signals ----------------------------------------------------------------
+
+std::vector<uint8_t>* BusNode::periodicData(uint32_t pgn)
+{
+    for (auto& p : periodics_) if (p.pgn == pgn) return &p.data;
+    return nullptr;
+}
+const std::vector<uint8_t>* BusNode::periodicData(uint32_t pgn) const
+{
+    for (auto& p : periodics_) if (p.pgn == pgn) return &p.data;
+    return nullptr;
+}
+
+void BusNode::addSignal(std::string label, std::string unit, uint32_t pgn, uint8_t off, uint8_t width,
+                        bool le, double scale, double offset, double minV, double maxV)
+{
+    signals_.push_back(LiveSignal{ std::move(label), std::move(unit), pgn, off, width, le, scale, offset, minV, maxV });
+}
+
+bool BusNode::signalInfo(int idx, std::string& label, std::string& unit, double& minV, double& maxV, double& cur) const
+{
+    if (idx < 0 || idx >= (int)signals_.size()) return false;
+    const LiveSignal& s = signals_[idx];
+    label = s.label; unit = s.unit; minV = s.minV; maxV = s.maxV;
+    const std::vector<uint8_t>* d = periodicData(s.pgn);
+    unsigned raw = 0;
+    if (d && (size_t)s.off + s.width <= d->size()) {
+        if (s.width == 2) raw = s.le ? ((unsigned)(*d)[s.off] | ((unsigned)(*d)[s.off + 1] << 8))
+                                     : (((unsigned)(*d)[s.off] << 8) | (unsigned)(*d)[s.off + 1]);
+        else raw = (*d)[s.off];
+    }
+    cur = (double)raw * s.scale + s.offset;
+    return true;
+}
+
+bool BusNode::setSignal(int idx, double value)
+{
+    if (idx < 0 || idx >= (int)signals_.size()) return false;
+    const LiveSignal& s = signals_[idx];
+    std::vector<uint8_t>* d = periodicData(s.pgn);
+    if (!d || (size_t)s.off + s.width > d->size()) return false;
+    if (value < s.minV) value = s.minV;
+    if (value > s.maxV) value = s.maxV;
+    long raw = (long)llround((value - s.offset) / s.scale);
+    long maxRaw = (s.width == 2) ? 0xFFFF : 0xFF;
+    if (raw < 0) raw = 0;
+    if (raw > maxRaw) raw = maxRaw;
+    if (s.width == 2) {
+        if (s.le) { (*d)[s.off] = (uint8_t)(raw & 0xFF); (*d)[s.off + 1] = (uint8_t)((raw >> 8) & 0xFF); }
+        else      { (*d)[s.off] = (uint8_t)((raw >> 8) & 0xFF); (*d)[s.off + 1] = (uint8_t)(raw & 0xFF); }
+    } else {
+        (*d)[s.off] = (uint8_t)(raw & 0xFF);
+    }
+    return true;
 }
 
 // ---- build the bus: engine's own broadcasts + the peripheral controllers -------------------
@@ -204,6 +329,22 @@ void EcmSim::buildBus()
     // =======================================================================================
     auto add = [&](BusNode&& n) { nodes_.push_back(std::move(n)); };
 
+    // Standard identity responses for a mobile-plant EH controller (note 02 step 2 / note 03 grid).
+    // Component ID answers a global sweep (the strongest positive ID); Software ID + ECU ID are
+    // destination-specific, so a GLOBAL 0xFEDA / 0xFDC5 request still resolves uniquely to the engine
+    // while each controller answers its own when addressed directly. make/model are the published
+    // vendor families with 'SIM' serials (clean-room — no real serial numbers or PINs).
+    auto ehIdentity = [&](BusNode& n, const char* make, const char* model,
+                          const char* serial, const char* unit, const char* sw, const char* ecuPart) {
+        n.addRequestResponse(PGN_COMPONENT_ID,
+            ascii(std::string(make) + "*" + model + "*" + serial + "*" + unit + "*"), true);        // global
+        std::vector<uint8_t> swid; swid.push_back(0x01);
+        auto s = ascii(std::string(model) + " " + sw + "*"); swid.insert(swid.end(), s.begin(), s.end());
+        n.addRequestResponse(PGN_SOFTWARE_ID, swid, true, /*destSpecificOnly*/ true);
+        n.addRequestResponse(PGN_ECUID,
+            ascii(std::string(ecuPart) + "*" + serial + "*" + make + "*"), true, /*destSpecificOnly*/ true);
+    };
+
     // Transmission #1 (SA 0x03)
     { BusNode n(0x03, 0x03, 0x0003, "Transmission #1");
       n.addPeriodic(0x00F002, 3, 100, { 0xF0,0x00,0x00,0xFF,0xFF,0x00,0x00,0xFF });   // ETC1 selected/current gear neutral
@@ -246,10 +387,27 @@ void EcmSim::buildBus()
       n.addRequestResponse(0x00FEEB, ascii("CATERPILLAR*BODY*SIM*0021*"), true);
       add(std::move(n)); }
 
-    // Implement / Hydraulics controller (SA 0x25) — mobile-plant work hydraulics (proprietary-B)
-    { BusNode n(0x25, 0x23, 0x0025, "Implement/Hydraulics");
-      n.addPeriodic(0x00FF20, 6, 500, { 0x20,0x4E,0x10,0x27,0xFF,0xFF,0xFF,0xFF });   // PropB simulated pump/implement pressures
-      n.addRequestResponse(0x00FEEB, ascii("CATERPILLAR*HYD*SIM*0025*"), true);
+    // Implement / Hydraulics main controller (SA 0x25) — Danfoss PLUS+1 MC-class machine controller
+    // broadcasting work-hydraulics telemetry. NAME: Industry Group 3 (Construction), function 23
+    // (illustrative machine-controller class), manufacturer 57 (Danfoss, published SAE assignment).
+    // Payloads are proprietary-B (manufacturer-defined by nature) with documented simulated values.
+    { BusNode n(0x25, "Implement/Hydraulics", /*IG*/3, /*vehSys*/0, /*func*/23, /*funcInst*/0, /*ecuInst*/0, /*mfg*/57, /*id*/250001);
+      // 0xFF20 pressures: pump/system [0:2] LE16 1 kPa/bit = 20000 kPa; pilot [2:4] = 3000 kPa;
+      //                   load-sense [4:6] = 18000 kPa; system flow-demand [6] = 50 % (0.4 %/bit).
+      n.addPeriodic(0x00FF20, 6, 100, { 0x20,0x4E,0xB8,0x0B,0x50,0x46,0x7D,0xFF });
+      // 0xFF21 pump/oil: swash [0] = 60 % (0.4 %/bit); pump command [1] = 55 %; main-pump flow [2:4]
+      //                  LE16 0.1 L/min/bit = 120.0 L/min; hyd-oil temp [4] = 65 C (1 C/bit, -40);
+      //                  hyd-oil level [5] = 80 % (0.4 %/bit).
+      n.addPeriodic(0x00FF21, 6, 500, { 0x96,0x89,0xB0,0x04,0x69,0xC8,0xFF,0xFF });
+      n.addSignal("Pump pressure", "kPa",  0x00FF20, 0, 2, true,  1.0,   0.0,   0, 35000);
+      n.addSignal("Pilot pressure","kPa",  0x00FF20, 2, 2, true,  1.0,   0.0,   0,  6000);
+      n.addSignal("Load sense",    "kPa",  0x00FF20, 4, 2, true,  1.0,   0.0,   0, 35000);
+      n.addSignal("Pump swash",    "%",    0x00FF21, 0, 1, false, 0.4,   0.0,   0,   100);
+      n.addSignal("Main flow",     "L/min",0x00FF21, 2, 2, true,  0.1,   0.0,   0,   300);
+      n.addSignal("Oil temp",      "C",    0x00FF21, 4, 1, false, 1.0, -40.0, -40,   150);
+      n.addSignal("Oil level",     "%",    0x00FF21, 5, 1, false, 0.4,   0.0,   0,   100);
+      ehIdentity(n, "DANFOSS", "PLUS1-MC050", "SIM", "0025", "APP 4.21", "11140345");
+      n.dmCapable = true;              // DM1 (seeded hydraulic oil over-temp — see seedDiagnostics)
       add(std::move(n)); }
 
     // Cab Controller — Primary (SA 0x31) — HVAC / operator (proprietary-B)
@@ -271,6 +429,114 @@ void EcmSim::buildBus()
       n.addPeriodic(0x00FEE6, 6,1000, { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF });   // TD time/date (not set)
       n.addPeriodic(0x00FEF3, 6,5000, { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF });   // VP vehicle position (no GPS fix)
       n.addRequestResponse(0x00FEEB, ascii("CATERPILLAR*TELE*SIM*0029*"), true);
+      add(std::move(n)); }
+
+    // =======================================================================================
+    //  MOBILE-PLANT ELECTRO-HYDRAULIC (EH) CONTROLLERS (program TPSAS-RES-002). A representative
+    //  off-highway work-hydraulics bus: a proportional valve driver, a hydrostatic drive, an I/O
+    //  expansion module, two Danfoss PVED-CC auxiliary valves and a Grayhill joystick / vehicle
+    //  display controller — each claiming a proper J1939-81 NAME (industry group / function /
+    //  manufacturer per note 02) so the TES discovery cascade + Topographer enumeration (notes
+    //  02/03) can be exercised end-to-end on a mixed plant bus. Telemetry is proprietary-B
+    //  (0xFF00..0xFFFF, manufacturer-defined by nature) with documented, simulated idle-point byte
+    //  layouts; NAME manufacturer/function codes are the published SAE/vendor values where the
+    //  project notes document them (Danfoss 57 / function 129; Grayhill 294 / function 135) and
+    //  clearly simulated otherwise. Clean-room: generic make/model families + 'SIM' serials, no
+    //  real serial numbers or PINs. Each is dmCapable, so the J1939-73 DM stack covers it for free.
+    // =======================================================================================
+
+    // Proportional valve driver (SA 0x27) — Danfoss / Eaton Pro-FX AxisPro-class section block.
+    { BusNode n(0x27, "Prop. Valve Driver", /*IG*/3, 0, /*func*/128 /*illustrative valve-driver*/, 0, 0, /*mfg*/57, 270001);
+      // 0xFF22 spool: measured positions s1..s4 [0:4], commanded s1..s4 [4:8] (0.4 %/bit, 50 % = centred).
+      n.addPeriodic(0x00FF22, 3, 50, { 0x7D,0x7D,0x7D,0x7D,0x7D,0x7D,0x7D,0x7D });
+      // 0xFF23 drive: solenoid-1 current [0:2] LE16 mA = 850; solenoid-2 [2:4] = 0; PWM duty s1 [4] = 42 %
+      //               (0.4 %/bit), s2 [5] = 0; supply [6:8] LE16 0.05 V/bit = 13.8 V.
+      n.addPeriodic(0x00FF23, 3, 50, { 0x52,0x03,0x00,0x00,0x69,0x00,0x14,0x01 });
+      n.addSignal("Spool 1",      "%",  0x00FF22, 0, 1, false, 0.4, 0.0, 0,  100);
+      n.addSignal("Spool 2",      "%",  0x00FF22, 1, 1, false, 0.4, 0.0, 0,  100);
+      n.addSignal("Spool 3",      "%",  0x00FF22, 2, 1, false, 0.4, 0.0, 0,  100);
+      n.addSignal("Spool 4",      "%",  0x00FF22, 3, 1, false, 0.4, 0.0, 0,  100);
+      n.addSignal("Solenoid 1 I", "mA", 0x00FF23, 0, 2, true,  1.0, 0.0, 0, 2500);
+      n.addSignal("Solenoid 2 I", "mA", 0x00FF23, 2, 2, true,  1.0, 0.0, 0, 2500);
+      ehIdentity(n, "DANFOSS", "PROFX-AXISPRO", "SIM", "0027", "VD 2.08", "11148820");
+      n.dmCapable = true;              // DM1 (seeded section-3 solenoid open circuit — seedDiagnostics)
+      add(std::move(n)); }
+
+    // Hydrostatic traction drive controller (SA 0x2B) — Sauer-Danfoss closed-loop propulsion.
+    { BusNode n(0x2B, "Hydrostatic Drive", 3, 0, /*func*/25 /*illustrative propulsion*/, 0, 0, /*mfg*/57, 430001);
+      // 0xFF24: ground speed [0:2] LE16 1/256 km/h = 0 (stationary); drive-pump command [2] = neutral
+      //         (0.4 %/bit, 50 %); motor displacement [3] = 100 % (0.4 %/bit); charge pressure [4:6]
+      //         LE16 1 kPa/bit = 2500 kPa; direction [6] = 0 (0 N / 1 fwd / 2 rev).
+      n.addPeriodic(0x00FF24, 3, 100, { 0x00,0x00,0x7D,0xFA,0xC4,0x09,0x00,0xFF });
+      n.addSignal("Ground speed",   "km/h", 0x00FF24, 0, 2, true,  1.0/256.0, 0.0, 0,   60);
+      n.addSignal("Pump command",   "%",    0x00FF24, 2, 1, false, 0.4,       0.0, 0,  100);
+      n.addSignal("Motor disp",     "%",    0x00FF24, 3, 1, false, 0.4,       0.0, 0,  100);
+      n.addSignal("Charge pressure","kPa",  0x00FF24, 4, 2, true,  1.0,       0.0, 0, 5000);
+      n.addSignal("Direction 0N1F2R","",    0x00FF24, 6, 1, false, 1.0,       0.0, 0,    2);
+      ehIdentity(n, "SAUER-DANFOSS", "SERIES90-H1", "SIM", "002B", "HS 1.16", "11153010");
+      n.dmCapable = true;
+      add(std::move(n)); }
+
+    // I/O expansion module (SA 0x2C) — ifm ecomat-class. Manufacturer code SIMULATED (not a published
+    // assignment) so the discovery's 'manufacturer-code only / inferred' (amber) path is exercised.
+    { BusNode n(0x2C, "I/O Module", 3, 0, /*func*/143 /*illustrative I/O*/, 0, 0, /*mfg*/0x3FF /*simulated*/, 440001);
+      // 0xFF25 analog inputs: AI0..AI3 as LE16 millivolts = 2500 / 500 / 0 / 1000.
+      n.addPeriodic(0x00FF25, 6, 200, { 0xC4,0x09,0xF4,0x01,0x00,0x00,0xE8,0x03 });
+      // 0xFF26 digital/output: digital-input bitmap [0] = 0x05; output bitmap [1] = 0; module temp [2]
+      //                        = 45 C (1 C/bit, -40); supply [3:5] LE16 0.05 V/bit = 13.9 V.
+      n.addPeriodic(0x00FF26, 6, 200, { 0x05,0x00,0x55,0x16,0x01,0xFF,0xFF,0xFF });
+      n.addSignal("AI0",         "mV", 0x00FF25, 0, 2, true,  1.0,   0.0,   0, 5000);
+      n.addSignal("AI1",         "mV", 0x00FF25, 2, 2, true,  1.0,   0.0,   0, 5000);
+      n.addSignal("AI2",         "mV", 0x00FF25, 4, 2, true,  1.0,   0.0,   0, 5000);
+      n.addSignal("AI3",         "mV", 0x00FF25, 6, 2, true,  1.0,   0.0,   0, 5000);
+      n.addSignal("Digital in",  "",   0x00FF26, 0, 1, false, 1.0,   0.0,   0,  255);
+      n.addSignal("Module temp", "C",  0x00FF26, 2, 1, false, 1.0, -40.0, -40,  120);
+      ehIdentity(n, "IFM", "ECOMAT-CR0033", "SIM", "002C", "IO 1.04", "11156620");
+      n.dmCapable = true;
+      add(std::move(n)); }
+
+    // Danfoss PVED-CC auxiliary valve #1 (SA 0x80) — J1939 / ISO 11783 (note 06). Published NAME:
+    // Identity 201001, manufacturer 57 (Danfoss), function 129 (auxiliary valve on tractor), vehicle
+    // system 1, industry group 2 (Agricultural), function instance 0 (= node-id index, 0x80 range).
+    { BusNode n(0x80, "PVED-CC Aux Valve 1", /*IG*/2, /*vehSys*/1, /*func*/129, /*funcInst*/0, 0, /*mfg*/57, 201001);
+      // 0xFF80: AVC command [0] (0.4 %/bit, 50 % = no command); AVEF estimated flow [1] (50 % = 0);
+      //         measured spool position [2] (50 % = centred); device state [3] = 1 (operational);
+      //         supply [4:6] LE16 0.05 V/bit = 13.8 V; valve temp [6] = 50 C (1 C/bit, -40).
+      n.addPeriodic(0x00FF80, 3, 50, { 0x7D,0x7D,0x7D,0x01,0x14,0x01,0x5A,0xFF });
+      n.addSignal("AVC command", "%", 0x00FF80, 0, 1, false, 0.4,   0.0,   0, 100);
+      n.addSignal("AVEF flow",   "%", 0x00FF80, 1, 1, false, 0.4,   0.0,   0, 100);
+      n.addSignal("Spool pos",   "%", 0x00FF80, 2, 1, false, 0.4,   0.0,   0, 100);
+      n.addSignal("Valve temp",  "C", 0x00FF80, 6, 1, false, 1.0, -40.0, -40, 120);
+      ehIdentity(n, "DANFOSS", "PVED-CC", "SIM", "0080", "S7 2.40", "11045501");
+      n.dmCapable = true;              // DM1 (seeded valve-position fault — seedDiagnostics)
+      add(std::move(n)); }
+
+    // Danfoss PVED-CC auxiliary valve #2 (SA 0x81) — same family, function instance 1 (exercises the
+    // NAME function-instance discriminator: 'which of N identical functions', note 02).
+    { BusNode n(0x81, "PVED-CC Aux Valve 2", /*IG*/2, /*vehSys*/1, /*func*/129, /*funcInst*/1, 0, /*mfg*/57, 201002);
+      n.addPeriodic(0x00FF81, 3, 50, { 0x7D,0x7D,0x7D,0x01,0x14,0x01,0x5A,0xFF });
+      n.addSignal("AVC command", "%", 0x00FF81, 0, 1, false, 0.4,   0.0,   0, 100);
+      n.addSignal("AVEF flow",   "%", 0x00FF81, 1, 1, false, 0.4,   0.0,   0, 100);
+      n.addSignal("Spool pos",   "%", 0x00FF81, 2, 1, false, 0.4,   0.0,   0, 100);
+      n.addSignal("Valve temp",  "C", 0x00FF81, 6, 1, false, 1.0, -40.0, -40, 120);
+      ehIdentity(n, "DANFOSS", "PVED-CC", "SIM", "0081", "S7 2.40", "11045501");
+      n.dmCapable = true;
+      add(std::move(n)); }
+
+    // Grayhill 3JG2 joystick / vehicle display controller (SA 0xF1) — J1939 (note 07). Published:
+    // manufacturer 294 (Grayhill), function 135, joystick broadcast on PGN 0xFF03. Industry group is
+    // not published for this part → Construction (3) assumed for the simulation.
+    { BusNode n(0xF1, "Joystick/VDC", /*IG*/3, 0, /*func*/135, 0, 0, /*mfg*/294, 241001);
+      // 0xFF03 joystick: X [0], Y [1], Z/twist [2] (0.4 %/bit, 50 % = centred); thumb-roller [3] = 0;
+      //                  button bitmap 0-7 [4], 8-15 [5] (none pressed); deadman/enable [6] = 1.
+      n.addPeriodic(0x00FF03, 3, 50, { 0x7D,0x7D,0x7D,0x00,0x00,0x00,0x01,0xFF });
+      n.addSignal("Joystick X",   "%", 0x00FF03, 0, 1, false, 0.8, -100.0, -100, 100);
+      n.addSignal("Joystick Y",   "%", 0x00FF03, 1, 1, false, 0.8, -100.0, -100, 100);
+      n.addSignal("Joystick Z",   "%", 0x00FF03, 2, 1, false, 0.8, -100.0, -100, 100);
+      n.addSignal("Thumb roller", "%", 0x00FF03, 3, 1, false, 0.4,    0.0,    0, 100);
+      n.addSignal("Buttons",      "",  0x00FF03, 4, 1, false, 1.0,    0.0,    0, 255);
+      ehIdentity(n, "GRAYHILL", "3JG2-VDC", "SIM", "00F1", "VDC 3.02", "3JG2-1965");
+      n.dmCapable = true;              // DM1 (seeded joystick-signal fault — seedDiagnostics)
       add(std::move(n)); }
 }
 
@@ -322,12 +588,37 @@ void EcmSim::respondToRequest(uint32_t reqPgn, uint8_t dst)
             // SPN237 VIN: configurable (default a reference-valid 17-char VIN), '*' terminator.
             case PGN_VIN:          sendBam(PGN_VIN, ascii(vin_ + "*")); break;
             case PGN_SOFTWARE_ID: {   // byte0 = field count, then '*'-delimited ASCII (SPN 234/965)
+                // Software ID drives the tool's target-family resolution ("ADEM<n>"). Configurable via
+                // ADEM_EMU_SWID so the one emulator can present as any generation for bench testing
+                // (e.g. set ADEM_EMU_SWID="ADEM6 6441970-00" to exercise the ADEM6/protected path).
                 std::vector<uint8_t> p; p.push_back(0x01);
-                auto s = ascii("ADEM4 2660376-00*"); p.insert(p.end(), s.begin(), s.end());
+                // Win32 GetEnvironmentVariableA (not std::getenv): the /MT static CRT does not reliably
+                // reflect the live process environment, so getenv can miss both inherited and
+                // runtime-set vars. GetEnvironmentVariableA reads the actual process env block.
+                char swbuf[64] = {0};
+                DWORD swn = GetEnvironmentVariableA("ADEM_EMU_SWID", swbuf, (DWORD)sizeof(swbuf));
+                std::string swid = (swn > 0 && swn < sizeof(swbuf)) ? std::string(swbuf) : std::string("ADEM4 2660376-00");
+                auto s = ascii(swid + "*"); p.insert(p.end(), s.begin(), s.end());
                 sendBam(PGN_SOFTWARE_ID, p);
                 break;
             }
             case PGN_COMPONENT_ID: sendBam(PGN_COMPONENT_ID, ascii("CATERPILLAR*ADEM4*SIM*0001*")); break;
+            case PGN_ECUID: {
+                // ECU Identification — the CAT ADEM ECU-info block, '*'-delimited ASCII over TP.
+                // Field ORDER follows the RE'd ECU parameter list: HardwareType, LocationCode,
+                // ECUPartNumber, PartNumber, ChangeNumber, CustomerECUPartNumber, ECUSerialNumber,
+                // BootPartNumber. Generic simulated values (clean-room — no Caterpillar data).
+                sendBam(PGN_ECUID, ascii(
+                    "ADEM4-SIM*"        // HardwareType
+                    "ENGINE*"           // LocationCode
+                    "2660376-00*"       // ECUPartNumber
+                    "5411785-00*"       // PartNumber
+                    "01*"               // ChangeNumber
+                    "0000000-00*"       // CustomerECUPartNumber
+                    "TPSAS0000000001*"  // ECUSerialNumber
+                    "2860911-00*"));    // BootPartNumber
+                break;
+            }
             case 0x00FEE5: {          // Engine Hours / Revolutions — SPN247 total hours, 0.05 h/bit
                 uint32_t raw = (uint32_t)(1234.5 / 0.05);   // 24690 ticks = 1234.5 h
                 J1939Msg m; m.pgn = 0x00FEE5; m.priority = 6; m.src = ECM_SA; m.dst = 0xFF;
@@ -339,7 +630,7 @@ void EcmSim::respondToRequest(uint32_t reqPgn, uint8_t dst)
         }
     }
     // Every other controller answers for the PGNs it owns.
-    for (auto& n : nodes_) if (dst == 0xFF || dst == n.sa()) n.respond(reqPgn, outq_);
+    for (auto& n : nodes_) if (dst == 0xFF || dst == n.sa()) n.respond(reqPgn, dst, outq_);
     // An address-claim request re-announces every node too.
     if (reqPgn == PGN_ADDRESS_CLAIMED)
         for (auto& n : nodes_) if (dst == 0xFF || dst == n.sa()) enqueue(n.addressClaimed());
@@ -371,6 +662,15 @@ void EcmSim::seedDiagnostics()
         if (n.sa() == 0x3D && !clean) {
             n.diag.active.push_back(Dtc{ 1761, 18, 0, 3 }); // SPN1761 DEF level, FMI18 (low moderate), OC3
             n.diag.stored.push_back(Dtc{ 3364, 2, 0, 1 });  // SPN3364 DEF quality, previously active
+        }
+        // Mobile-plant EH controllers: a few seeded faults so the DM read path returns data on the new
+        // nodes too. SPN 1638 is the real SAE hydraulic-oil-temperature SPN; the valve/joystick codes
+        // are proprietary-range SPNs (519192+), simulated. FMIs are standard J1939-73.
+        if (!clean) {
+            if (n.sa() == 0x25) n.diag.active.push_back(Dtc{ 1638,   16, 0, 1 }); // hyd oil temp, FMI16 high-moderate
+            if (n.sa() == 0x27) n.diag.active.push_back(Dtc{ 520192,  5, 0, 1 }); // valve solenoid sec.3, FMI5 current low / open
+            if (n.sa() == 0x80) n.diag.active.push_back(Dtc{ 520300,  7, 0, 1 }); // valve spool, FMI7 mechanical not responding
+            if (n.sa() == 0xF1) n.diag.active.push_back(Dtc{ 520400,  2, 0, 1 }); // joystick axis, FMI2 data erratic
         }
         n.diag.recomputeLamps();
         n.diag.readinessSupported = 0x00FF; n.diag.readinessComplete = 0x00FF;
@@ -416,6 +716,17 @@ void EcmSim::serviceDiag(unsigned long long now)
 bool EcmSim::handleDiagRequest(uint32_t reqPgn, uint8_t dst)
 {
     using namespace j1939diag;
+    if (reqPgn == PGN_DM11 || reqPgn == PGN_DM3) {
+        // J1939-73: DM3/DM11 are REQUESTED (PGN 59904 carrying the DM PGN); each addressed module
+        // clears and answers the requester with a positive ACKM.
+        for (auto& mod : diagModules()) {
+            uint8_t sa = mod.first; DiagState& d = *mod.second;
+            if (dst != 0xFF && dst != sa) continue;
+            if (reqPgn == PGN_DM11) d.clearActive(); else d.clearStored();
+            sendAck(sa, toolSa_, reqPgn, 0x00 /*positive*/);
+        }
+        return true;
+    }
     if (reqPgn != PGN_DM1 && reqPgn != PGN_DM2 && reqPgn != PGN_DM5 && reqPgn != PGN_DM4) return false;
     for (auto& mod : diagModules()) {
         uint8_t sa = mod.first; DiagState& d = *mod.second;
@@ -510,14 +821,52 @@ void EcmSim::setFaultByName(const char* name)
     fault_ = Fault::None; faultArmed_ = false;
     if (!name) return;
     if      (_stricmp(name, "inappropriate") == 0) fault_ = Fault::Inappropriate;
+    else if (_stricmp(name, "badfileinfo")   == 0) fault_ = Fault::BadFileInfo;
     else if (_stricmp(name, "invalidoffset") == 0) { fault_ = Fault::InvalidOffset; faultArmed_ = true; }
     else if (_stricmp(name, "badchecksum")   == 0) fault_ = Fault::BadChecksum;
     else if (_stricmp(name, "erasefail")     == 0) fault_ = Fault::EraseFail;
     else if (_stricmp(name, "stuck")         == 0) fault_ = Fault::Stuck;
+    writeSharedFault(name);   // publish so a separate flash client process sees this fault
+}
+
+void EcmSim::refreshFaultFromShared()
+{
+    std::string name = readSharedFault();
+    if (name.empty()) return;   // no shared control -> keep the current (env-derived) fault
+    fault_ = Fault::None; faultArmed_ = false;
+    if      (_stricmp(name.c_str(), "inappropriate") == 0) fault_ = Fault::Inappropriate;
+    else if (_stricmp(name.c_str(), "badfileinfo")   == 0) fault_ = Fault::BadFileInfo;
+    else if (_stricmp(name.c_str(), "invalidoffset") == 0) { fault_ = Fault::InvalidOffset; faultArmed_ = true; }
+    else if (_stricmp(name.c_str(), "badchecksum")   == 0) fault_ = Fault::BadChecksum;
+    else if (_stricmp(name.c_str(), "erasefail")     == 0) fault_ = Fault::EraseFail;
+    else if (_stricmp(name.c_str(), "stuck")         == 0) fault_ = Fault::Stuck;
 }
 
 bool EcmSim::flashActive() { std::lock_guard<std::mutex> lk(mu_); return inFlash_; }
 
+void EcmSim::setToolSa(uint8_t sa) { std::lock_guard<std::mutex> lk(mu_); toolSa_ = sa; }
+
+// Live drivable signals (console sliders). Engine (SA 0x00) exposes none for now; the mobile-plant
+// EH BusNodes carry their drivable telemetry. Locked so a set can't race the bus service in poll().
+int EcmSim::signalCount(uint8_t sa)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    if (sa == ECM_SA) return 0;
+    for (auto& n : nodes_) if (n.sa() == sa) return n.signalCount();
+    return 0;
+}
+bool EcmSim::signalInfo(uint8_t sa, int idx, std::string& label, std::string& unit, double& minV, double& maxV, double& cur)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& n : nodes_) if (n.sa() == sa) return n.signalInfo(idx, label, unit, minV, maxV, cur);
+    return false;
+}
+bool EcmSim::setSignal(uint8_t sa, int idx, double value)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& n : nodes_) if (n.sa() == sa) return n.setSignal(idx, value);
+    return false;
+}
 // ---- entry points -------------------------------------------------------------------------
 
 void EcmSim::onSend(const J1939Msg& m)
@@ -550,6 +899,13 @@ void EcmSim::onSend(const J1939Msg& m)
         case PGN_TP_DT:
             handleTpDt(m);
             break;
+        case catsec::PGN_DM14:
+            handleDm14(m);
+            break;
+        case catsec::PGN_DM16:
+            handleDm16(m);
+            break;
+
         default:
             break;
     }
@@ -648,6 +1004,7 @@ void EcmSim::handleCatExt(uint8_t src, const std::vector<uint8_t>& payload)
         if (cmd == catj::FC_OK && mode == catj::M_INFLASH) {
             // Enter flash. A real ECM refuses with InappropriateToFlash if preconditions (e.g.
             // engine stopped) are not met — modelled by the 'inappropriate' fault.
+            refreshFaultFromShared();   // pull a fault armed in another process (the console)
             if (fault_ == Fault::Inappropriate) { replyStatus(src, catj::FC_INAPPROPRIATE, catj::M_NOTFLASH, {}); break; }
             beginFlash();
             replyStatus(src, catj::FC_OK, catj::M_INFLASH, {});
@@ -670,6 +1027,8 @@ void EcmSim::handleCatExt(uint8_t src, const std::vector<uint8_t>& payload)
     }
     case catj::PID_FLASH_INFO: {
         if (!inFlash_) break;                 // only meaningful in flash mode
+        // A real ECM validates the software part number here; 'badfileinfo' models a rejected one.
+        if (fault_ == Fault::BadFileInfo) { replyStatus(src, catj::FC_BADFILEINFO, flashMode_, {}); break; }
         if (!parseFileInfo(post, plen)) { replyStatus(src, catj::FC_BADFILEINFO, flashMode_, {}); break; }
         flashMode_ = catj::M_FILE;
         replyStatus(src, catj::FC_OK, catj::M_FILE, {});
@@ -717,8 +1076,114 @@ void EcmSim::handleCatExt(uint8_t src, const std::vector<uint8_t>& payload)
     }
 }
 
+// ---- CAT access-level (password) over DM14/15/16 (ECM side; RE/04 §3.2) -------------------
+void EcmSim::handleDm14(const J1939Msg& m)
+{
+    uint16_t length = 0, key = 0; uint8_t command = 0; uint32_t pointer = 0;
+    if (!catsec::parseDm14(m.data, length, command, pointer, key)) return;
+    memCommand_ = command;
+    memPointer_ = pointer;
+
+    // Reply DM15 Proceed with an unsecured seed (0xFFFF) — the simulator never secures these
+    // regions (RE/04 §8 Q3). A real ECM may return a real seed; that is the verify-on-iron gap.
+    J1939Msg r; r.pgn = catsec::PGN_DM15; r.priority = 6; r.src = ECM_SA; r.dst = m.src;
+    r.data = catsec::buildDm15(length ? length : 8, catsec::ST_PROCEED, catsec::SEED_UNSECURED);
+    enqueue(r);
+
+    // A read: answer with a DM16 carrying the requested value (current level, or a stored config
+    // parameter), then a closing DM15 OperationCompleted.
+    if (command == catsec::CMD_READ) {
+        std::vector<uint8_t> value; bool known = true;
+        if (catsec::pointerMatches(pointer, catsec::MAP_LEVEL_READ)) {
+            value = { (uint8_t)secLevel_ };
+        } else {
+            auto it = params_.find(pointer & catsec::PTR_MASK);
+            if (it != params_.end()) value = it->second; else known = false;
+        }
+        if (known) {
+            J1939Msg d; d.pgn = catsec::PGN_DM16; d.priority = 6; d.src = ECM_SA; d.dst = m.src;
+            d.data = catsec::buildDm16(value);
+            enqueue(d);
+            J1939Msg done; done.pgn = catsec::PGN_DM15; done.priority = 6; done.src = ECM_SA; done.dst = m.src;
+            done.data = catsec::buildDm15((uint16_t)value.size(), catsec::ST_OP_DONE, catsec::SEED_UNSECURED);
+            enqueue(done);
+        }
+    }
+}
+
+void EcmSim::handleDm16(const J1939Msg& m)
+{
+    if (m.data.empty()) return;
+    int n = m.data[0]; if (n > (int)m.data.size() - 1) n = (int)m.data.size() - 1;
+    std::vector<uint8_t> value(m.data.begin() + 1, m.data.begin() + 1 + n);
+
+    uint8_t status = catsec::ST_OP_DONE;   // becomes OP_FAILED if the ECM refuses the write
+
+    // Password-write pointers carry security material; everything else is a config parameter.
+    if (memCommand_ == catsec::CMD_WRITE && catsec::pointerMatches(memPointer_, catsec::MAP_PASSWORD_1)) {
+        secPw1_ = catsec::padPassword(value.data(), (int)value.size());
+    } else if (memCommand_ == catsec::CMD_WRITE && catsec::pointerMatches(memPointer_, catsec::MAP_PASSWORD_2)) {
+        secPw2_ = catsec::padPassword(value.data(), (int)value.size());
+        evaluateSecurity();   // the ECM evaluates on receipt of password 2 (RE/04 §3.2)
+    } else if (memCommand_ == catsec::CMD_WRITE && catsec::pointerMatches(memPointer_, catsec::MAP_CUST_PW_1)) {
+        custPw1_ = catsec::padPassword(value.data(), (int)value.size());
+    } else if (memCommand_ == catsec::CMD_WRITE && catsec::pointerMatches(memPointer_, catsec::MAP_CUST_PW_2)) {
+        custPw2_ = catsec::padPassword(value.data(), (int)value.size());
+    } else if (memCommand_ == catsec::CMD_WRITE) {
+        // Config parameter write: the ECM enforces the required level (RE/04 §3.5). Below it, refuse
+        // with OperationFailed and leave the stored value untouched — exactly what a real ECM does.
+        uint32_t key = memPointer_ & catsec::PTR_MASK;
+        auto lv = paramWriteLevel_.find(key);
+        int required = (lv != paramWriteLevel_.end()) ? lv->second : catsec::LVL_FACTORY;
+        if (secLevel_ >= required) params_[key] = value;
+        else status = catsec::ST_OP_FAILED;
+    }
+
+    // Closing DM15 (OperationCompleted, or OperationFailed if the write was refused).
+    J1939Msg done; done.pgn = catsec::PGN_DM15; done.priority = 6; done.src = ECM_SA; done.dst = m.src;
+    done.data = catsec::buildDm15((uint16_t)value.size(), status, catsec::SEED_UNSECURED);
+    enqueue(done);
+}
+
+// Emulator test parameters: (24-bit pointer -> value) with a required write level. No real rating /
+// FLS / FTS / immobiliser PIDs are modelled (RE/04 §7.1). Pointers are in the CAT map range.
+void EcmSim::seedConfigParams()
+{
+    params_.clear(); paramWriteLevel_.clear();
+    auto put = [&](uint32_t ptr, std::vector<uint8_t> v, int wl) {
+        uint32_t k = ptr & catsec::PTR_MASK; params_[k] = std::move(v); paramWriteLevel_[k] = wl;
+    };
+    put(0xFFFF10, { 0x00, 0x07 }, catsec::LVL_CUSTOMER);      // "Equipment ID / unit number" (u16 = 7)
+    put(0xFFFF11, { 0x02, 0xEE }, catsec::LVL_SERVICE_TOOL);  // "Low idle rpm" (u16 = 750)
+    put(0xFFFF12, { 0x01 },       catsec::LVL_FACTORY);       // "Parameter lockout flag" (factory-gated)
+}
+
+void EcmSim::evaluateSecurity()
+{
+    // Byte-compare ladder (RE/04 §3.3), WITHOUT the simulator's permissive "any non-blank pair ->
+    // Factory" rule 4 — that is not how a real ECM behaves.
+    auto eq = [](const std::vector<uint8_t>& a, const uint8_t* b) {
+        if (a.size() != (size_t)catsec::PW_WIDTH) return false;
+        for (int i = 0; i < catsec::PW_WIDTH; ++i) if (a[(size_t)i] != b[i]) return false;
+        return true;
+    };
+    if (eq(secPw1_, catsec::SERVICE_TOOL_PW1) && eq(secPw2_, catsec::SERVICE_TOOL_PW2)) {
+        secLevel_ = catsec::LVL_SERVICE_TOOL;
+    } else if (!custPw1_.empty() && secPw1_ == custPw1_ && secPw2_ == custPw2_) {
+        secLevel_ = catsec::LVL_CUSTOMER;
+    } else if (eq(secPw1_, catsec::TRAINER_FACTORY_PW1) && eq(secPw2_, catsec::TRAINER_FACTORY_PW2)) {
+        // TRAINER/SIMULATOR ONLY (RE/04 §3.3): CAT's trainer factory pair. A real ECM rejects it and
+        // needs a Factory Password System credential; the sim honours it so factory edits can be
+        // rehearsed end to end.
+        secLevel_ = catsec::LVL_FACTORY;
+    } else {
+        secLevel_ = catsec::LVL_NORMAL;   // no match; real factory pairs are not known to the sim
+    }
+}
+
 void EcmSim::handleTpCm(const J1939Msg& m)
 {
+
     if (m.data.size() < 8 || m.data[0] != 0x10) return;   // only RTS (connection mode) handled
     tpActive_ = true;
     tpSrc_ = m.src;
